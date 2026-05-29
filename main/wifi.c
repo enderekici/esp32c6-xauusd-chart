@@ -102,7 +102,8 @@ void wifi_start(void)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wc));
     ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_MIN_MODEM));
 
     xTaskCreate(rssi_task, "wifi_rssi", 3072, NULL, 3, NULL);
-    ESP_LOGI(TAG, "STA starting, connecting to '%s'", WIFI_SSID);
+    ESP_LOGI(TAG, "STA starting, connecting to '%s' (min modem-sleep)", WIFI_SSID);
 }

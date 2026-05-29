@@ -5,6 +5,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_http_client.h"
 #include "esp_websocket_client.h"
 #include "esp_crt_bundle.h"
@@ -14,8 +15,6 @@ static const char *TAG = "market";
 
 #define MARKET_HOST "https://data-api.binance.vision"
 #define URL_KLINES  MARKET_HOST "/api/v3/klines?symbol=PAXGUSDT&interval=15m&limit=96"
-#define URL_PRICE   MARKET_HOST "/api/v3/ticker/price?symbol=PAXGUSDT"
-#define URL_24HR    MARKET_HOST "/api/v3/ticker/24hr?symbol=PAXGUSDT"
 
 // Market-data-only WebSocket host (mirror of stream.binance.com, no key/geo
 // block). The @ticker stream pushes a 24h rolling stat once per second.
@@ -24,7 +23,7 @@ static const char *TAG = "market";
 // Keyless true-spot XAU/USD (matches the OANDA print on TradingView). Price
 // only, no history/change — polled for the headline number.
 #define URL_SPOT "https://api.gold-api.com/price/XAU"
-#define SPOT_POLL_MS 6000
+#define SPOT_POLL_MS 60000
 
 // klines for 96 candles is several KB; ticker responses are tiny. Use one
 // generous heap buffer for all three requests.
@@ -86,34 +85,6 @@ static int http_get(const char *url, char *buf, int cap)
     return out;
 }
 
-static bool parse_price(const char *json, float *out)
-{
-    cJSON *root = cJSON_Parse(json);
-    if (!root) return false;
-    bool ok = false;
-    cJSON *p = cJSON_GetObjectItemCaseSensitive(root, "price");
-    if (cJSON_IsString(p) && p->valuestring) {
-        *out = (float)atof(p->valuestring);
-        ok = true;
-    }
-    cJSON_Delete(root);
-    return ok;
-}
-
-static bool parse_change(const char *json, float *out)
-{
-    cJSON *root = cJSON_Parse(json);
-    if (!root) return false;
-    bool ok = false;
-    cJSON *c = cJSON_GetObjectItemCaseSensitive(root, "priceChangePercent");
-    if (cJSON_IsString(c) && c->valuestring) {
-        *out = (float)atof(c->valuestring);
-        ok = true;
-    }
-    cJSON_Delete(root);
-    return ok;
-}
-
 // klines is a JSON array of arrays; element index 4 is the close (string).
 static int parse_klines(const char *json, float *closes, int max)
 {
@@ -136,7 +107,7 @@ static int parse_klines(const char *json, float *closes, int max)
     return n;
 }
 
-bool market_fetch(market_data_t *out)
+bool market_fetch_history(market_data_t *out)
 {
     memset(out, 0, sizeof(*out));
 
@@ -146,43 +117,22 @@ bool market_fetch(market_data_t *out)
         return false;
     }
 
-    bool ok = true;
-
-    // Spot price.
-    int n = http_get(URL_PRICE, buf, RESP_CAP);
-    if (n > 0 && parse_price(buf, &out->price)) {
-        // ok
-    } else {
-        ESP_LOGW(TAG, "price fetch/parse failed");
-        ok = false;
-    }
-
-    // 24h change percent.
-    n = http_get(URL_24HR, buf, RESP_CAP);
-    if (n > 0 && parse_change(buf, &out->change_pct)) {
-        // ok
-    } else {
-        ESP_LOGW(TAG, "24hr fetch/parse failed");
-        ok = false;
-    }
-
-    // Candles.
-    n = http_get(URL_KLINES, buf, RESP_CAP);
+    bool ok = false;
+    int n = http_get(URL_KLINES, buf, RESP_CAP);
     if (n > 0) {
         out->n_closes = parse_klines(buf, out->closes, MARKET_MAX_CLOSES);
-        if (out->n_closes == 0) {
+        if (out->n_closes > 0) {
+            ok = true;
+        } else {
             ESP_LOGW(TAG, "klines parse yielded 0 points");
-            ok = false;
         }
     } else {
         ESP_LOGW(TAG, "klines fetch failed");
-        ok = false;
     }
 
     free(buf);
     out->ok = ok;
-    ESP_LOGI(TAG, "fetch ok=%d price=%.2f chg=%.2f%% pts=%d",
-             ok, out->price, out->change_pct, out->n_closes);
+    ESP_LOGI(TAG, "history fetch ok=%d pts=%d", ok, out->n_closes);
     return ok;
 }
 
@@ -195,6 +145,11 @@ static bool                s_live_valid;
 static float               s_spot_price;
 static bool                s_spot_valid;
 static volatile bool       s_live_connected;
+static int64_t             s_last_live_us;
+static int64_t             s_last_spot_us;
+static uint32_t            s_ws_connect_count;
+static uint32_t            s_ws_disconnect_count;
+static uint32_t            s_spot_fail_count;
 static esp_websocket_client_handle_t s_ws;
 
 // Parse one @ticker frame: "c" = last price, "P" = 24h change %.
@@ -212,6 +167,7 @@ static void parse_ticker(const char *json, int len)
         s_live_price  = price;
         s_live_change = change;
         s_live_valid  = true;
+        s_last_live_us = esp_timer_get_time();
         xSemaphoreGive(s_live_mtx);
         if (first) {
             ESP_LOGI(TAG, "live tick: price=%.2f chg=%.2f%%", price, change);
@@ -252,8 +208,13 @@ static void spot_task(void *arg)
             bool first = !s_spot_valid;
             s_spot_price = price;
             s_spot_valid = true;
+            s_last_spot_us = esp_timer_get_time();
             xSemaphoreGive(s_live_mtx);
             if (first) ESP_LOGI(TAG, "spot: XAU=%.2f", price);
+        } else {
+            xSemaphoreTake(s_live_mtx, portMAX_DELAY);
+            s_spot_fail_count++;
+            xSemaphoreGive(s_live_mtx);
         }
         vTaskDelay(pdMS_TO_TICKS(SPOT_POLL_MS));
     }
@@ -266,10 +227,20 @@ static void ws_event_cb(void *arg, esp_event_base_t base, int32_t id, void *data
     switch (id) {
     case WEBSOCKET_EVENT_CONNECTED:
         s_live_connected = true;
+        if (s_live_mtx) {
+            xSemaphoreTake(s_live_mtx, portMAX_DELAY);
+            s_ws_connect_count++;
+            xSemaphoreGive(s_live_mtx);
+        }
         ESP_LOGI(TAG, "ws connected");
         break;
     case WEBSOCKET_EVENT_DISCONNECTED:
         s_live_connected = false;
+        if (s_live_mtx) {
+            xSemaphoreTake(s_live_mtx, portMAX_DELAY);
+            s_ws_disconnect_count++;
+            xSemaphoreGive(s_live_mtx);
+        }
         ESP_LOGW(TAG, "ws disconnected");
         break;
     case WEBSOCKET_EVENT_DATA:
@@ -340,4 +311,29 @@ bool market_spot_get(float *price)
     if (valid && price) *price = s_spot_price;
     xSemaphoreGive(s_live_mtx);
     return valid;
+}
+
+void market_status_get(market_status_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    out->live_connected = s_live_connected;
+    if (!s_live_mtx) return;
+
+    int64_t now = esp_timer_get_time();
+    xSemaphoreTake(s_live_mtx, portMAX_DELAY);
+    out->live_valid = s_live_valid;
+    out->spot_valid = s_spot_valid;
+    out->live_price = s_live_price;
+    out->live_change_pct = s_live_change;
+    out->spot_price = s_spot_price;
+    out->ws_connect_count = s_ws_connect_count;
+    out->ws_disconnect_count = s_ws_disconnect_count;
+    out->spot_fail_count = s_spot_fail_count;
+    if (s_last_live_us > 0) {
+        out->live_age_s = (uint32_t)((now - s_last_live_us) / 1000000);
+    }
+    if (s_last_spot_us > 0) {
+        out->spot_age_s = (uint32_t)((now - s_last_spot_us) / 1000000);
+    }
+    xSemaphoreGive(s_live_mtx);
 }

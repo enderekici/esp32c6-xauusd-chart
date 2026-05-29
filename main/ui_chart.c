@@ -1,6 +1,7 @@
 #include "ui_chart.h"
 
 #include <stdio.h>
+#include <string.h>
 #include <time.h>
 
 #include "board.h"
@@ -9,8 +10,10 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "esp_timer.h"
 #include "esp_log.h"
+#include "nvs.h"
 #include "lvgl.h"
 #include "esp_lvgl_port.h"
 
@@ -26,7 +29,15 @@ static const char *TAG = "ui";
 #define COL_GREY   0x7a88a0
 #define COL_TEXT   0xd6deeb
 
-#define REFRESH_PERIOD_MS 45000
+#define HISTORY_REFRESH_PERIOD_MS (15 * 60 * 1000)
+#define HISTORY_RETRY_PERIOD_MS   30000
+#define LIVE_UI_PERIOD_MS         1000
+#define FOOTER_PERIOD_MS          5000
+#define BACKLIGHT_DAY_PERCENT     30
+#define BACKLIGHT_NIGHT_PERCENT   6
+#define SETTINGS_NS               "chart_ui"
+#define SETTINGS_KEY_MODE         "mode"
+#define SETTINGS_KEY_BRIGHTNESS   "bright"
 
 static lv_obj_t *lbl_price;
 static lv_obj_t *lbl_change;
@@ -36,6 +47,16 @@ static lv_obj_t *dot_live;   // small circle: green = WS connected, grey = down
 static lv_obj_t *lbl_live;   // "LIVE" text next to the dot
 static lv_obj_t *chart;
 static lv_chart_series_t *series;
+static SemaphoreHandle_t s_state_mtx;
+static TaskHandle_t s_fetch_task_handle;
+static ui_chart_display_mode_t s_display_mode = UI_CHART_DISPLAY_AUTO;
+static uint8_t s_configured_percent = BACKLIGHT_DAY_PERCENT;
+static uint8_t s_backlight_percent = BACKLIGHT_DAY_PERCENT;
+static int64_t s_wake_until_us;
+static uint32_t s_history_success_count;
+static uint32_t s_history_fail_count;
+static int s_chart_points;
+static bool s_history_valid;
 
 // Index of the chart's final loaded point (and its close value), so the live
 // ticker can nudge just the tip without reloading the whole series.
@@ -44,6 +65,47 @@ static float s_last_close;
 
 // Wall-clock (esp_timer) seconds of the last successful data update.
 static int64_t s_last_update_us;
+
+static void load_display_settings(void)
+{
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(SETTINGS_NS, NVS_READONLY, &nvs);
+    if (err != ESP_OK) {
+        return;
+    }
+
+    uint8_t mode = UI_CHART_DISPLAY_AUTO;
+    uint8_t brightness = BACKLIGHT_DAY_PERCENT;
+    nvs_get_u8(nvs, SETTINGS_KEY_MODE, &mode);
+    nvs_get_u8(nvs, SETTINGS_KEY_BRIGHTNESS, &brightness);
+    nvs_close(nvs);
+
+    if (mode <= UI_CHART_DISPLAY_CUSTOM && brightness <= 100) {
+        xSemaphoreTake(s_state_mtx, portMAX_DELAY);
+        s_display_mode = (ui_chart_display_mode_t)mode;
+        s_configured_percent = brightness;
+        xSemaphoreGive(s_state_mtx);
+        ESP_LOGI(TAG, "loaded display settings: mode=%s brightness=%u%%",
+                 ui_chart_display_mode_name(s_display_mode), (unsigned)brightness);
+    }
+}
+
+static void save_display_settings(ui_chart_display_mode_t mode, uint8_t brightness)
+{
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(SETTINGS_NS, NVS_READWRITE, &nvs);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "settings open failed: %s", esp_err_to_name(err));
+        return;
+    }
+    err = nvs_set_u8(nvs, SETTINGS_KEY_MODE, (uint8_t)mode);
+    if (err == ESP_OK) err = nvs_set_u8(nvs, SETTINGS_KEY_BRIGHTNESS, brightness);
+    if (err == ESP_OK) err = nvs_commit(nvs);
+    nvs_close(nvs);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "settings save failed: %s", esp_err_to_name(err));
+    }
+}
 
 static lv_obj_t *mk_label(lv_obj_t *parent, const lv_font_t *font, uint32_t color)
 {
@@ -184,10 +246,160 @@ static void apply_data(const market_data_t *d)
         s_last_idx   = d->n_closes - 1;
     }
 
-    render_price(d->price, d->change_pct, d->ok);
+    float paxg, change, spot;
+    bool have_live = market_live_get(&paxg, &change);
+    bool have_spot = market_spot_get(&spot);
+    if (have_spot) {
+        render_price(spot, change, have_live);
+    } else if (have_live) {
+        render_price(paxg, change, true);
+    }
 }
 
-// 1Hz timer: ticks the clock line and refreshes the footer (IP / RSSI / age).
+const char *ui_chart_display_mode_name(ui_chart_display_mode_t mode)
+{
+    switch (mode) {
+    case UI_CHART_DISPLAY_AUTO:   return "auto";
+    case UI_CHART_DISPLAY_DAY:    return "day";
+    case UI_CHART_DISPLAY_DIM:    return "dim";
+    case UI_CHART_DISPLAY_OFF:    return "off";
+    case UI_CHART_DISPLAY_CUSTOM: return "custom";
+    default:                      return "unknown";
+    }
+}
+
+bool ui_chart_parse_display_mode(const char *mode, ui_chart_display_mode_t *out)
+{
+    if (!mode || !out) return false;
+    if (strcmp(mode, "auto") == 0) {
+        *out = UI_CHART_DISPLAY_AUTO;
+    } else if (strcmp(mode, "day") == 0) {
+        *out = UI_CHART_DISPLAY_DAY;
+    } else if (strcmp(mode, "dim") == 0) {
+        *out = UI_CHART_DISPLAY_DIM;
+    } else if (strcmp(mode, "off") == 0) {
+        *out = UI_CHART_DISPLAY_OFF;
+    } else {
+        return false;
+    }
+    return true;
+}
+
+static uint8_t compute_backlight_target(void)
+{
+    int64_t now_us = esp_timer_get_time();
+    if (s_wake_until_us > now_us) return BACKLIGHT_DAY_PERCENT;
+
+    ui_chart_display_mode_t mode = s_display_mode;
+    uint8_t custom = s_configured_percent;
+    switch (mode) {
+    case UI_CHART_DISPLAY_DAY:
+        return BACKLIGHT_DAY_PERCENT;
+    case UI_CHART_DISPLAY_DIM:
+        return BACKLIGHT_NIGHT_PERCENT;
+    case UI_CHART_DISPLAY_OFF:
+        return 0;
+    case UI_CHART_DISPLAY_CUSTOM:
+        return custom;
+    case UI_CHART_DISPLAY_AUTO:
+    default:
+        break;
+    }
+
+    time_t now = time(NULL);
+    if (now <= 1600000000) return BACKLIGHT_DAY_PERCENT;
+
+    struct tm tm;
+    localtime_r(&now, &tm);
+    return (tm.tm_hour >= 22 || tm.tm_hour < 7)
+        ? BACKLIGHT_NIGHT_PERCENT
+        : BACKLIGHT_DAY_PERCENT;
+}
+
+static void apply_backlight_policy(void)
+{
+    xSemaphoreTake(s_state_mtx, portMAX_DELAY);
+    uint8_t target = compute_backlight_target();
+    if (target != s_backlight_percent) {
+        if (lcd_set_backlight_percent(target) == ESP_OK) {
+            s_backlight_percent = target;
+            ESP_LOGI(TAG, "backlight %u%%", (unsigned)target);
+        }
+    }
+    xSemaphoreGive(s_state_mtx);
+}
+
+bool ui_chart_set_display_mode(ui_chart_display_mode_t mode)
+{
+    if (mode < UI_CHART_DISPLAY_AUTO || mode > UI_CHART_DISPLAY_OFF) return false;
+    uint8_t brightness = (mode == UI_CHART_DISPLAY_DAY) ? BACKLIGHT_DAY_PERCENT :
+                         (mode == UI_CHART_DISPLAY_DIM) ? BACKLIGHT_NIGHT_PERCENT :
+                         (mode == UI_CHART_DISPLAY_OFF) ? 0 :
+                         BACKLIGHT_DAY_PERCENT;
+    xSemaphoreTake(s_state_mtx, portMAX_DELAY);
+    s_display_mode = mode;
+    s_configured_percent = brightness;
+    s_wake_until_us = 0;
+    xSemaphoreGive(s_state_mtx);
+    save_display_settings(mode, brightness);
+    apply_backlight_policy();
+    return true;
+}
+
+bool ui_chart_set_custom_brightness(uint8_t percent)
+{
+    if (percent > 100) return false;
+    xSemaphoreTake(s_state_mtx, portMAX_DELAY);
+    s_display_mode = UI_CHART_DISPLAY_CUSTOM;
+    s_configured_percent = percent;
+    s_wake_until_us = 0;
+    xSemaphoreGive(s_state_mtx);
+    save_display_settings(UI_CHART_DISPLAY_CUSTOM, percent);
+    apply_backlight_policy();
+    return true;
+}
+
+void ui_chart_wake_for(uint32_t seconds)
+{
+    if (seconds == 0) seconds = 60;
+    if (seconds > 3600) seconds = 3600;
+    xSemaphoreTake(s_state_mtx, portMAX_DELAY);
+    s_wake_until_us = esp_timer_get_time() + (int64_t)seconds * 1000000;
+    xSemaphoreGive(s_state_mtx);
+    apply_backlight_policy();
+}
+
+void ui_chart_force_refresh(void)
+{
+    if (s_fetch_task_handle) {
+        xTaskNotifyGive(s_fetch_task_handle);
+    }
+}
+
+void ui_chart_status_get(ui_chart_status_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    int64_t now = esp_timer_get_time();
+    out->uptime_s = (uint32_t)(now / 1000000);
+
+    xSemaphoreTake(s_state_mtx, portMAX_DELAY);
+    out->mode = s_display_mode;
+    out->configured_percent = s_configured_percent;
+    out->effective_percent = s_backlight_percent;
+    if (s_wake_until_us > now) {
+        out->wake_remaining_s = (uint32_t)((s_wake_until_us - now + 999999) / 1000000);
+    }
+    out->history_success_count = s_history_success_count;
+    out->history_fail_count = s_history_fail_count;
+    out->chart_points = s_chart_points;
+    out->history_valid = s_history_valid;
+    if (s_last_update_us > 0) {
+        out->last_history_age_s = (uint32_t)((now - s_last_update_us) / 1000000);
+    }
+    xSemaphoreGive(s_state_mtx);
+}
+
+// Slow timer: ticks the clock line, refreshes the footer, and applies dimming.
 static void footer_cb(lv_timer_t *t)
 {
     (void)t;
@@ -203,6 +415,7 @@ static void footer_cb(lv_timer_t *t)
     } else {
         lv_label_set_text(lbl_clock, "syncing time...");
     }
+    apply_backlight_policy();
 
     if (wifi_is_connected()) {
         lv_label_set_text_fmt(lbl_footer, "%s   %ddBm", wifi_ip(), wifi_rssi());
@@ -265,22 +478,35 @@ static void fetch_task(void *arg)
         }
 
         // Network I/O happens OUTSIDE the LVGL lock.
-        bool ok = market_fetch(d);
+        bool ok = market_fetch_history(d);
 
         lvgl_port_lock(0);
         apply_data(d);
         lvgl_port_unlock();
 
         if (ok) {
+            xSemaphoreTake(s_state_mtx, portMAX_DELAY);
             s_last_update_us = esp_timer_get_time();
+            s_history_success_count++;
+            s_chart_points = d->n_closes;
+            s_history_valid = true;
+            xSemaphoreGive(s_state_mtx);
+        } else {
+            xSemaphoreTake(s_state_mtx, portMAX_DELAY);
+            s_history_fail_count++;
+            xSemaphoreGive(s_state_mtx);
         }
 
-        vTaskDelay(pdMS_TO_TICKS(ok ? REFRESH_PERIOD_MS : 10000));
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(ok ? HISTORY_REFRESH_PERIOD_MS : HISTORY_RETRY_PERIOD_MS));
     }
 }
 
 void ui_chart_start(lcd_t *lcd)
 {
+    s_state_mtx = xSemaphoreCreateMutex();
+    load_display_settings();
+    apply_backlight_policy();
+
     lvgl_port_cfg_t pcfg = ESP_LVGL_PORT_INIT_CONFIG();
     ESP_ERROR_CHECK(lvgl_port_init(&pcfg));
 
@@ -310,11 +536,11 @@ void ui_chart_start(lcd_t *lcd)
 
     lvgl_port_lock(0);
     build_ui();
-    lv_timer_create(footer_cb, 1000, NULL);
-    lv_timer_create(live_cb, 500, NULL);
+    lv_timer_create(footer_cb, FOOTER_PERIOD_MS, NULL);
+    lv_timer_create(live_cb, LIVE_UI_PERIOD_MS, NULL);
     footer_cb(NULL);
     lvgl_port_unlock();
 
-    xTaskCreate(fetch_task, "market_fetch", 6144, NULL, 4, NULL);
+    xTaskCreate(fetch_task, "market_fetch", 12288, NULL, 4, &s_fetch_task_handle);
     ESP_LOGI(TAG, "chart UI up");
 }

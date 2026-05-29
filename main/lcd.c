@@ -10,6 +10,7 @@
 #include "driver/gpio.h"
 #include "driver/ledc.h"
 #include "driver/spi_master.h"
+#include "esp_check.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_lcd_panel_io.h"
@@ -18,6 +19,8 @@
 #include "Vernon_ST7789T.h"
 
 static const char *TAG = "lcd";
+
+#define LCD_BACKLIGHT_MAX_DUTY ((1 << LEDC_TIMER_10_BIT) - 1)
 
 esp_err_t lcd_init(lcd_t *lcd)
 {
@@ -102,10 +105,21 @@ esp_err_t lcd_init(lcd_t *lcd)
     }
     lcd->glyph_idx = 0;
 
-    // 30% duty — bright enough to read indoors, runs cool.
-    ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 300));
-    ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0));
+    // 30% duty: bright enough to read indoors, much cooler than the vendor
+    // demo's high backlight settings.
+    ESP_ERROR_CHECK(lcd_set_backlight_percent(30));
     ESP_LOGI(TAG, "ST7789 %dx%d initialised", BOARD_LCD_H_RES, BOARD_LCD_V_RES);
+    return ESP_OK;
+}
+
+esp_err_t lcd_set_backlight_percent(uint8_t percent)
+{
+    if (percent > 100) percent = 100;
+    uint32_t duty = (LCD_BACKLIGHT_MAX_DUTY * percent + 50) / 100;
+    ESP_RETURN_ON_ERROR(ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty),
+                        TAG, "set backlight duty");
+    ESP_RETURN_ON_ERROR(ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0),
+                        TAG, "update backlight duty");
     return ESP_OK;
 }
 

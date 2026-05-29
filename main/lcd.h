@@ -19,6 +19,9 @@ typedef struct {
 
 esp_err_t lcd_init(lcd_t *lcd);
 
+// Set LCD backlight brightness in percent. 0 turns the backlight off.
+esp_err_t lcd_set_backlight_percent(uint8_t percent);
+
 // Fill the whole panel with a 16-bit RGB565 colour (big-endian on the wire).
 void lcd_fill(lcd_t *lcd, uint16_t color);
 

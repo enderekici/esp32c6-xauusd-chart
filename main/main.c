@@ -11,6 +11,7 @@
 #include "lcd.h"
 #include "wifi.h"
 #include "ui_chart.h"
+#include "http_control.h"
 #include "led_strip.h"
 
 static const char *TAG = "app";
@@ -69,6 +70,7 @@ void app_main(void)
     wifi_start();
     time_sync_start();
     ui_chart_start(&lcd);
+    http_control_start();
 
     ESP_LOGI(TAG, "init complete");
 }

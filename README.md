@@ -90,6 +90,35 @@ idf.py -p /dev/tty.usbmodemXXX flash monitor
 `main/secrets.h` is gitignored; the committed `main/secrets.example.h` is the
 template. No market-data API keys are needed.
 
+## OTA from GitHub Actions
+
+The workflow at `.github/workflows/firmware.yml` builds the ESP-IDF app on every
+push to `main`, uploads the firmware as a workflow artifact, and publishes OTA
+files to the `gh-pages` branch:
+
+- `xauusd_chart.bin` — app image used by OTA
+- `version.json` — version, commit, SHA-256, size, and URL metadata
+- `bootloader.bin` and `partition-table.bin` — reference files for USB recovery
+
+Repository setup:
+
+1. Add GitHub repository secrets `WIFI_SSID` and `WIFI_PASS`.
+2. Enable GitHub Pages from the `gh-pages` branch, root folder.
+3. After the first successful workflow run, the OTA URL is:
+
+```text
+https://enderekici.github.io/esp32c6-xauusd-chart/xauusd_chart.bin
+```
+
+The board can install that URL from the dashboard OTA box or with:
+
+```sh
+curl -X POST 'http://192.168.2.14/api/ota?url=https%3A%2F%2Fenderekici.github.io%2Fesp32c6-xauusd-chart%2Fxauusd_chart.bin'
+```
+
+USB flashing is still the recovery path if a future firmware breaks Wi-Fi or
+OTA.
+
 ## LVGL display gotchas (ST7789T + esp_lvgl_port)
 
 Two non-obvious flags in `ui_chart_start()` — both required:
