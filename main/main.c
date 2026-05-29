@@ -1,8 +1,10 @@
 #include <stdio.h>
+#include <time.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
+#include "esp_sntp.h"
 #include "nvs_flash.h"
 
 #include "board.h"
@@ -35,6 +37,18 @@ static void rgb_led_off(void)
     }
 }
 
+// London time (GMT in winter, BST/UTC+1 in summer; DST per EU rules). SNTP runs
+// in the background; the RTC steps once the first NTP response lands, and the
+// UI clock starts ticking.
+static void time_sync_start(void)
+{
+    setenv("TZ", "GMT0BST,M3.5.0/1,M10.5.0", 1);
+    tzset();
+    esp_sntp_setoperatingmode(ESP_SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "pool.ntp.org");
+    esp_sntp_init();
+}
+
 void app_main(void)
 {
     ESP_LOGI(TAG, "PAXG/USD gold chart booting");
@@ -53,6 +67,7 @@ void app_main(void)
     ESP_ERROR_CHECK(lcd_init(&lcd));
 
     wifi_start();
+    time_sync_start();
     ui_chart_start(&lcd);
 
     ESP_LOGI(TAG, "init complete");

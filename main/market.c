@@ -2,8 +2,11 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_http_client.h"
+#include "esp_websocket_client.h"
 #include "esp_crt_bundle.h"
 #include "cJSON.h"
 
@@ -13,6 +16,10 @@ static const char *TAG = "market";
 #define URL_KLINES  MARKET_HOST "/api/v3/klines?symbol=PAXGUSDT&interval=15m&limit=96"
 #define URL_PRICE   MARKET_HOST "/api/v3/ticker/price?symbol=PAXGUSDT"
 #define URL_24HR    MARKET_HOST "/api/v3/ticker/24hr?symbol=PAXGUSDT"
+
+// Market-data-only WebSocket host (mirror of stream.binance.com, no key/geo
+// block). The @ticker stream pushes a 24h rolling stat once per second.
+#define WS_URI "wss://data-stream.binance.vision/ws/paxgusdt@ticker"
 
 // klines for 96 candles is several KB; ticker responses are tiny. Use one
 // generous heap buffer for all three requests.
@@ -172,4 +179,107 @@ bool market_fetch(market_data_t *out)
     ESP_LOGI(TAG, "fetch ok=%d price=%.2f chg=%.2f%% pts=%d",
              ok, out->price, out->change_pct, out->n_closes);
     return ok;
+}
+
+// ---- Live WebSocket ticker -------------------------------------------------
+
+static SemaphoreHandle_t   s_live_mtx;
+static float               s_live_price;
+static float               s_live_change;
+static bool                s_live_valid;
+static volatile bool       s_live_connected;
+static esp_websocket_client_handle_t s_ws;
+
+// Parse one @ticker frame: "c" = last price, "P" = 24h change %.
+static void parse_ticker(const char *json, int len)
+{
+    cJSON *root = cJSON_ParseWithLength(json, len);
+    if (!root) return;
+    cJSON *c = cJSON_GetObjectItemCaseSensitive(root, "c");
+    cJSON *p = cJSON_GetObjectItemCaseSensitive(root, "P");
+    if (cJSON_IsString(c) && c->valuestring && cJSON_IsString(p) && p->valuestring) {
+        float price  = (float)atof(c->valuestring);
+        float change = (float)atof(p->valuestring);
+        xSemaphoreTake(s_live_mtx, portMAX_DELAY);
+        bool first = !s_live_valid;
+        s_live_price  = price;
+        s_live_change = change;
+        s_live_valid  = true;
+        xSemaphoreGive(s_live_mtx);
+        if (first) {
+            ESP_LOGI(TAG, "live tick: price=%.2f chg=%.2f%%", price, change);
+        }
+    }
+    cJSON_Delete(root);
+}
+
+static void ws_event_cb(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    (void)arg; (void)base;
+    esp_websocket_event_data_t *e = (esp_websocket_event_data_t *)data;
+    switch (id) {
+    case WEBSOCKET_EVENT_CONNECTED:
+        s_live_connected = true;
+        ESP_LOGI(TAG, "ws connected");
+        break;
+    case WEBSOCKET_EVENT_DISCONNECTED:
+        s_live_connected = false;
+        ESP_LOGW(TAG, "ws disconnected");
+        break;
+    case WEBSOCKET_EVENT_DATA:
+        // op_code 1 = text. A @ticker frame is small and arrives whole; ignore
+        // pings/pongs and any zero-length control frames.
+        if (e->op_code == 0x01 && e->data_len > 0 &&
+            e->payload_offset == 0 && e->data_len == e->payload_len) {
+            parse_ticker(e->data_ptr, e->data_len);
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+void market_live_start(void)
+{
+    if (s_ws) return;  // already running
+    s_live_mtx = xSemaphoreCreateMutex();
+
+    esp_websocket_client_config_t cfg = {
+        .uri                  = WS_URI,
+        .crt_bundle_attach    = esp_crt_bundle_attach,
+        .reconnect_timeout_ms = 5000,
+        .network_timeout_ms   = 10000,
+        .buffer_size          = 2048,
+        .task_stack           = 5120,
+    };
+    s_ws = esp_websocket_client_init(&cfg);
+    if (!s_ws) {
+        ESP_LOGE(TAG, "ws init failed");
+        return;
+    }
+    esp_websocket_register_events(s_ws, WEBSOCKET_EVENT_ANY, ws_event_cb, NULL);
+    esp_err_t err = esp_websocket_client_start(s_ws);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "ws start: %s", esp_err_to_name(err));
+        return;
+    }
+    ESP_LOGI(TAG, "live ticker started (%s)", WS_URI);
+}
+
+bool market_live_get(float *price, float *change_pct)
+{
+    if (!s_live_mtx) return false;
+    xSemaphoreTake(s_live_mtx, portMAX_DELAY);
+    bool valid = s_live_valid;
+    if (valid) {
+        if (price)      *price = s_live_price;
+        if (change_pct) *change_pct = s_live_change;
+    }
+    xSemaphoreGive(s_live_mtx);
+    return valid;
+}
+
+bool market_live_connected(void)
+{
+    return s_live_connected;
 }

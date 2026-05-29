@@ -1,5 +1,8 @@
 #include "ui_chart.h"
 
+#include <stdio.h>
+#include <time.h>
+
 #include "board.h"
 #include "wifi.h"
 #include "market.h"
@@ -27,9 +30,17 @@ static const char *TAG = "ui";
 
 static lv_obj_t *lbl_price;
 static lv_obj_t *lbl_change;
+static lv_obj_t *lbl_clock;
 static lv_obj_t *lbl_footer;
+static lv_obj_t *dot_live;   // small circle: green = WS connected, grey = down
+static lv_obj_t *lbl_live;   // "LIVE" text next to the dot
 static lv_obj_t *chart;
 static lv_chart_series_t *series;
+
+// Index of the chart's final loaded point (and its close value), so the live
+// ticker can nudge just the tip without reloading the whole series.
+static int   s_last_idx = -1;
+static float s_last_close;
 
 // Wall-clock (esp_timer) seconds of the last successful data update.
 static int64_t s_last_update_us;
@@ -61,11 +72,40 @@ static void build_ui(void)
     lv_obj_t *sub = mk_label(scr, &lv_font_montserrat_14, COL_GREY);
     lv_label_set_text(sub, "gold proxy");
 
+    lbl_clock = mk_label(scr, &lv_font_montserrat_14, COL_CYAN);
+    lv_label_set_text(lbl_clock, "syncing time...");
+
     lbl_price = mk_label(scr, &lv_font_montserrat_28, COL_TEXT);
     lv_label_set_text(lbl_price, "----.--");
 
-    lbl_change = mk_label(scr, &lv_font_montserrat_16, COL_GREY);
+    // Change line: percent on the left, a LIVE dot + label pinned to the right.
+    lv_obj_t *row = lv_obj_create(scr);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_width(row, lv_pct(100));
+    lv_obj_set_height(row, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(row, 5, 0);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lbl_change = lv_label_create(row);
+    lv_obj_set_style_text_font(lbl_change, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(lbl_change, lv_color_hex(COL_GREY), 0);
+    lv_obj_set_flex_grow(lbl_change, 1);
     lv_label_set_text(lbl_change, "+0.00%");
+
+    dot_live = lv_obj_create(row);
+    lv_obj_remove_style_all(dot_live);
+    lv_obj_set_size(dot_live, 10, 10);
+    lv_obj_set_style_radius(dot_live, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_opa(dot_live, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(dot_live, lv_color_hex(COL_GREY), 0);
+
+    lbl_live = lv_label_create(row);
+    lv_obj_set_style_text_font(lbl_live, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(lbl_live, lv_color_hex(COL_GREY), 0);
+    lv_label_set_text(lbl_live, "LIVE");
 
     // Chart fills the remaining vertical space.
     chart = lv_chart_create(scr);
@@ -91,6 +131,25 @@ static void build_ui(void)
 
     lbl_footer = mk_label(scr, &lv_font_montserrat_14, COL_GREY);
     lv_label_set_text(lbl_footer, "connecting...");
+}
+
+// Render the headline price + 24h change labels. Must run under the LVGL lock.
+// libc snprintf for %f — LVGL's lv_snprintf drops floats unless
+// LV_SPRINTF_USE_FLOAT is set, rendering "$f" / "+f%" instead of numbers.
+static void render_price(float price, float change_pct, bool have_change)
+{
+    char buf[32];
+    if (price > 0.0f) {
+        snprintf(buf, sizeof(buf), "$%.2f", price);
+        lv_label_set_text(lbl_price, buf);
+    }
+    if (have_change) {
+        bool pos = change_pct >= 0.0f;
+        snprintf(buf, sizeof(buf), "%s%.2f%% 24h", pos ? "+" : "", change_pct);
+        lv_label_set_text(lbl_change, buf);
+        lv_obj_set_style_text_color(lbl_change,
+                                    lv_color_hex(pos ? COL_GREEN : COL_RED), 0);
+    }
 }
 
 // Recompute the y-range from the data and (re)load the series. Must run under
@@ -121,39 +180,53 @@ static void apply_data(const market_data_t *d)
         bool up = d->closes[d->n_closes - 1] >= d->closes[0];
         lv_chart_set_series_color(chart, series,
                                   lv_color_hex(up ? COL_GREEN : COL_CYAN));
+        s_last_close = d->closes[d->n_closes - 1];
+        s_last_idx   = d->n_closes - 1;
     }
 
-    if (d->price > 0.0f) {
-        lv_label_set_text_fmt(lbl_price, "$%.2f", d->price);
-    }
-
-    if (d->ok) {
-        bool pos = d->change_pct >= 0.0f;
-        lv_label_set_text_fmt(lbl_change, "%s%.2f%% 24h",
-                              pos ? "+" : "", d->change_pct);
-        lv_obj_set_style_text_color(lbl_change,
-                                    lv_color_hex(pos ? COL_GREEN : COL_RED), 0);
-    }
+    render_price(d->price, d->change_pct, d->ok);
 }
 
-// Refresh just the footer (called from a 1s LVGL timer so "Ns ago" ticks).
+// 1Hz timer: ticks the clock line and refreshes the footer (IP / RSSI / age).
 static void footer_cb(lv_timer_t *t)
 {
     (void)t;
-    int ago = -1;
-    if (s_last_update_us > 0) {
-        ago = (int)((esp_timer_get_time() - s_last_update_us) / 1000000LL);
+
+    // Clock — only show once SNTP has stepped the RTC past the 2020 epoch.
+    time_t now = time(NULL);
+    if (now > 1600000000) {
+        struct tm tm;
+        localtime_r(&now, &tm);
+        char ts[32];
+        strftime(ts, sizeof(ts), "%a %d %b  %H:%M:%S", &tm);
+        lv_label_set_text(lbl_clock, ts);
+    } else {
+        lv_label_set_text(lbl_clock, "syncing time...");
     }
+
     if (wifi_is_connected()) {
-        if (ago >= 0) {
-            lv_label_set_text_fmt(lbl_footer, "%s  %ddBm  upd %ds ago",
-                                  wifi_ip(), wifi_rssi(), ago);
-        } else {
-            lv_label_set_text_fmt(lbl_footer, "%s  %ddBm  fetching...",
-                                  wifi_ip(), wifi_rssi());
-        }
+        lv_label_set_text_fmt(lbl_footer, "%s   %ddBm", wifi_ip(), wifi_rssi());
     } else {
         lv_label_set_text(lbl_footer, "Wi-Fi down");
+    }
+
+    // LIVE indicator tracks the WebSocket: green when streaming, grey when down.
+    uint32_t live_col = market_live_connected() ? COL_GREEN : COL_GREY;
+    lv_obj_set_style_bg_color(dot_live, lv_color_hex(live_col), 0);
+    lv_obj_set_style_text_color(lbl_live, lv_color_hex(live_col), 0);
+}
+
+// Fast timer: pull the latest WebSocket ticker value and update the headline
+// price/change live, plus nudge the chart's last point so the line tip tracks.
+static void live_cb(lv_timer_t *t)
+{
+    (void)t;
+    float price, change;
+    if (!market_live_get(&price, &change)) return;
+    render_price(price, change, true);
+    if (s_last_idx >= 0) {
+        lv_chart_set_value_by_id(chart, series, s_last_idx,
+                                 (int32_t)(price + 0.5f));
     }
 }
 
@@ -167,11 +240,18 @@ static void fetch_task(void *arg)
         return;
     }
 
+    bool live_started = false;
     while (true) {
         // Wait for Wi-Fi before hammering the network.
         if (!wifi_is_connected()) {
             vTaskDelay(pdMS_TO_TICKS(2000));
             continue;
+        }
+
+        // Open the live WebSocket once, after the link (and thus DNS) is up.
+        if (!live_started) {
+            market_live_start();
+            live_started = true;
         }
 
         // Network I/O happens OUTSIDE the LVGL lock.
@@ -221,6 +301,7 @@ void ui_chart_start(lcd_t *lcd)
     lvgl_port_lock(0);
     build_ui();
     lv_timer_create(footer_cb, 1000, NULL);
+    lv_timer_create(live_cb, 500, NULL);
     footer_cb(NULL);
     lvgl_port_unlock();
 

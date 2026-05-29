@@ -6,3 +6,5 @@ dependencies:
     version: "^2"
   espressif/led_strip:
     version: "^2.5"
+  espressif/esp_websocket_client:
+    version: "^1.2"
