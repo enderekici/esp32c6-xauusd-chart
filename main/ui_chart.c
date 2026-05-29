@@ -67,10 +67,10 @@ static void build_ui(void)
     lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *title = mk_label(scr, &lv_font_montserrat_20, COL_CYAN);
-    lv_label_set_text(title, "PAXG / USD");
+    lv_label_set_text(title, "XAU / USD");
 
     lv_obj_t *sub = mk_label(scr, &lv_font_montserrat_14, COL_GREY);
-    lv_label_set_text(sub, "gold proxy");
+    lv_label_set_text(sub, "gold spot");
 
     lbl_clock = mk_label(scr, &lv_font_montserrat_14, COL_CYAN);
     lv_label_set_text(lbl_clock, "syncing time...");
@@ -221,12 +221,22 @@ static void footer_cb(lv_timer_t *t)
 static void live_cb(lv_timer_t *t)
 {
     (void)t;
-    float price, change;
-    if (!market_live_get(&price, &change)) return;
-    render_price(price, change, true);
-    if (s_last_idx >= 0) {
+    float paxg, change, spot;
+    bool have_live = market_live_get(&paxg, &change);
+    bool have_spot = market_spot_get(&spot);
+
+    // Headline = true spot (gold-api); fall back to the PAXG tick until spot
+    // arrives. 24h change always comes from PAXG (gold moves with it).
+    if (have_spot) {
+        render_price(spot, change, have_live);
+    } else if (have_live) {
+        render_price(paxg, change, true);
+    }
+
+    // Chart tip tracks the live PAXG tick (the series is loaded in PAXG space).
+    if (have_live && s_last_idx >= 0) {
         lv_chart_set_value_by_id(chart, series, s_last_idx,
-                                 (int32_t)(price + 0.5f));
+                                 (int32_t)(paxg + 0.5f));
     }
 }
 

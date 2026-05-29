@@ -21,6 +21,11 @@ static const char *TAG = "market";
 // block). The @ticker stream pushes a 24h rolling stat once per second.
 #define WS_URI "wss://data-stream.binance.vision/ws/paxgusdt@ticker"
 
+// Keyless true-spot XAU/USD (matches the OANDA print on TradingView). Price
+// only, no history/change — polled for the headline number.
+#define URL_SPOT "https://api.gold-api.com/price/XAU"
+#define SPOT_POLL_MS 6000
+
 // klines for 96 candles is several KB; ticker responses are tiny. Use one
 // generous heap buffer for all three requests.
 #define RESP_CAP (16 * 1024)
@@ -187,6 +192,8 @@ static SemaphoreHandle_t   s_live_mtx;
 static float               s_live_price;
 static float               s_live_change;
 static bool                s_live_valid;
+static float               s_spot_price;
+static bool                s_spot_valid;
 static volatile bool       s_live_connected;
 static esp_websocket_client_handle_t s_ws;
 
@@ -211,6 +218,45 @@ static void parse_ticker(const char *json, int len)
         }
     }
     cJSON_Delete(root);
+}
+
+// gold-api returns {"price":4511.10,...} — price is a JSON number, not string.
+static bool parse_spot(const char *json, float *out)
+{
+    cJSON *root = cJSON_Parse(json);
+    if (!root) return false;
+    bool ok = false;
+    cJSON *p = cJSON_GetObjectItemCaseSensitive(root, "price");
+    if (cJSON_IsNumber(p)) {
+        *out = (float)p->valuedouble;
+        ok = true;
+    }
+    cJSON_Delete(root);
+    return ok;
+}
+
+static void spot_task(void *arg)
+{
+    (void)arg;
+    char *buf = malloc(1024);
+    if (!buf) {
+        ESP_LOGE(TAG, "spot buf alloc failed");
+        vTaskDelete(NULL);
+        return;
+    }
+    while (true) {
+        int n = http_get(URL_SPOT, buf, 1024);
+        float price;
+        if (n > 0 && parse_spot(buf, &price)) {
+            xSemaphoreTake(s_live_mtx, portMAX_DELAY);
+            bool first = !s_spot_valid;
+            s_spot_price = price;
+            s_spot_valid = true;
+            xSemaphoreGive(s_live_mtx);
+            if (first) ESP_LOGI(TAG, "spot: XAU=%.2f", price);
+        }
+        vTaskDelay(pdMS_TO_TICKS(SPOT_POLL_MS));
+    }
 }
 
 static void ws_event_cb(void *arg, esp_event_base_t base, int32_t id, void *data)
@@ -264,6 +310,8 @@ void market_live_start(void)
         return;
     }
     ESP_LOGI(TAG, "live ticker started (%s)", WS_URI);
+
+    xTaskCreate(spot_task, "spot", 5120, NULL, 4, NULL);
 }
 
 bool market_live_get(float *price, float *change_pct)
@@ -282,4 +330,14 @@ bool market_live_get(float *price, float *change_pct)
 bool market_live_connected(void)
 {
     return s_live_connected;
+}
+
+bool market_spot_get(float *price)
+{
+    if (!s_live_mtx) return false;
+    xSemaphoreTake(s_live_mtx, portMAX_DELAY);
+    bool valid = s_spot_valid;
+    if (valid && price) *price = s_spot_price;
+    xSemaphoreGive(s_live_mtx);
+    return valid;
 }

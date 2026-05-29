@@ -35,6 +35,10 @@ bool market_live_get(float *price, float *change_pct);
 // during a reconnect). Thread-safe.
 bool market_live_connected(void);
 
+// Latest true-spot XAU/USD price from gold-api (the number matching
+// TradingView). Returns true once a price has been fetched. Thread-safe.
+bool market_spot_get(float *price);
+
 #ifdef __cplusplus
 }
 #endif
