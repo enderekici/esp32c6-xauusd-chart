@@ -1,0 +1,29 @@
+# Target
+CONFIG_IDF_TARGET="esp32c6"
+
+# Flash size (Waveshare ESP32-C6-LCD-1.47 has 8MB embedded flash)
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="8MB"
+
+# Custom partition table: nvs + phy_init + single 3MB factory app.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
+
+# Main task stack
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=6144
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+CONFIG_LOG_DEFAULT_LEVEL=3
+
+# LCD: keep the SPI master driver in IRAM for smooth flushes.
+CONFIG_SPI_MASTER_IN_IRAM=y
+
+# TLS cert bundle for HTTPS to data-api.binance.vision (default-on, explicit).
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
+
+# LVGL fonts (Montserrat) for the chart UI.
+CONFIG_LV_FONT_MONTSERRAT_14=y
+CONFIG_LV_FONT_MONTSERRAT_16=y
+CONFIG_LV_FONT_MONTSERRAT_20=y
+CONFIG_LV_FONT_MONTSERRAT_28=y
