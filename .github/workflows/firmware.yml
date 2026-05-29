@@ -50,7 +50,7 @@ jobs:
           cp build/bootloader/bootloader.bin ota/bootloader.bin
           cp build/partition_table/partition-table.bin ota/partition-table.bin
 
-          COMMIT="$(git rev-parse --short HEAD)"
+          COMMIT="${GITHUB_SHA::7}"
           VERSION="build-${GITHUB_RUN_NUMBER}-${COMMIT}"
           BUILD_DATE="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
           SHA256="$(sha256sum ota/xauusd_chart.bin | awk '{print $1}')"
