@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include "esp_http_server.h"
+#include "esp_app_desc.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 
@@ -65,7 +66,7 @@ static bool url_decode(const char *in, char *out, size_t out_len)
 
 static esp_err_t root_handler(httpd_req_t *req)
 {
-    common_headers(req, "text/html");
+    common_headers(req, "text/html; charset=utf-8");
     static const char html[] =
         "<!doctype html><html><head><meta name=viewport content='width=device-width,initial-scale=1'>"
         "<title>XAU/USD ESP32-C6</title><style>"
@@ -79,6 +80,7 @@ static esp_err_t root_handler(httpd_req_t *req)
         "</style></head><body><main><div class=top><div><h1>XAU / USD</h1><div class=sub>ESP32-C6 live chart control</div></div><div id=live class=muted>LIVE</div></div>"
         "<div id=price class=price>--</div><div id=change class=change>--</div>"
         "<div class=grid>"
+        "<div class=card><div class=label>Firmware</div><div id=firmware class=value>--</div></div>"
         "<div class=card><div class=label>Wi-Fi</div><div id=wifi class=value>--</div></div>"
         "<div class=card><div class=label>Display</div><div id=display class=value>--</div></div>"
         "<div class=card><div class=label>Sources</div><div id=sources class=value>--</div></div>"
@@ -97,7 +99,8 @@ static esp_err_t root_handler(httpd_req_t *req)
         "async function load(){let r=await fetch('/api/status');let s=await r.json();last=s;"
         "$('price').textContent=s.market.spot_valid?'$'+s.market.spot_price.toFixed(2):(s.market.live_valid?'$'+s.market.live_price.toFixed(2):'--');"
         "let pos=s.market.live_change_pct>=0;$('change').textContent=(s.market.live_valid?`${pos?'+':''}${s.market.live_change_pct.toFixed(2)}% 24h`:'--');$('change').className='change '+(pos?'ok':'bad');"
-        "$('live').textContent=s.market.ws_connected?'● LIVE':'● OFF';$('live').className=s.market.ws_connected?'ok':'muted';"
+        "$('live').textContent=s.market.ws_connected?'\\u25cf LIVE':'\\u25cf OFF';$('live').className=s.market.ws_connected?'ok':'muted';"
+        "$('firmware').textContent=`${s.app.version}  ${s.app.date}`;"
         "$('wifi').textContent=s.wifi.connected?`${s.wifi.ip}  ${s.wifi.rssi}dBm`:'down';"
         "$('display').textContent=`${s.display.mode}  ${s.display.effective_percent}%${s.display.wake_remaining_s?' wake '+s.display.wake_remaining_s+'s':''}`;"
         "$('sources').textContent=`WS ${age(s.market.live_age_s)}  Spot ${age(s.market.spot_age_s)}  Hist ${age(s.history.age_s)}`;"
@@ -122,16 +125,19 @@ static esp_err_t status_handler(httpd_req_t *req)
     market_status_get(&market);
     ota_update_status_get(&ota);
 
-    char *json = malloc(2048);
+    const esp_app_desc_t *app = esp_app_get_description();
+
+    char *json = malloc(2600);
     if (!json) {
         common_headers(req, "application/json");
         httpd_resp_set_status(req, "500 Internal Server Error");
         return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"oom\"}");
     }
 
-    int n = snprintf(json, 2048,
+    int n = snprintf(json, 2600,
         "{"
         "\"uptime_s\":%lu,"
+        "\"app\":{\"project\":\"%s\",\"version\":\"%s\",\"date\":\"%s\",\"time\":\"%s\",\"idf\":\"%s\"},"
         "\"wifi\":{\"connected\":%s,\"ip\":\"%s\",\"rssi\":%d},"
         "\"heap\":{\"free\":%lu,\"min_free\":%lu,\"largest_block\":%lu},"
         "\"display\":{\"mode\":\"%s\",\"configured_percent\":%u,\"effective_percent\":%u,\"wake_remaining_s\":%lu},"
@@ -143,6 +149,11 @@ static esp_err_t status_handler(httpd_req_t *req)
         "\"ota\":{\"state\":\"%s\",\"message\":\"%s\",\"url\":\"%s\",\"started_s\":%lu,\"finished_s\":%lu,\"rebooting\":%s}"
         "}",
         (unsigned long)ui.uptime_s,
+        app->project_name,
+        app->version,
+        app->date,
+        app->time,
+        app->idf_ver,
         wifi_is_connected() ? "true" : "false", wifi_ip(), wifi_rssi(),
         (unsigned long)esp_get_free_heap_size(),
         (unsigned long)esp_get_minimum_free_heap_size(),

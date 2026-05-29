@@ -34,8 +34,21 @@ jobs:
           #define WIFI_PASS "${WIFI_PASS:-CHANGE_ME}"
           EOF
 
+      - name: Get build metadata
+        id: meta
+        shell: bash
+        run: |
+          COMMIT="${GITHUB_SHA::7}"
+          VERSION="build-${GITHUB_RUN_NUMBER}-${COMMIT}"
+          BUILD_DATE="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          echo "commit=$COMMIT" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "build_date=$BUILD_DATE" >> "$GITHUB_OUTPUT"
+
       - name: Build firmware
         shell: bash
+        env:
+          APP_VERSION: ${{ steps.meta.outputs.version }}
         run: |
           . "$IDF_PATH/export.sh"
           idf.py set-target esp32c6
@@ -50,9 +63,9 @@ jobs:
           cp build/bootloader/bootloader.bin ota/bootloader.bin
           cp build/partition_table/partition-table.bin ota/partition-table.bin
 
-          COMMIT="${GITHUB_SHA::7}"
-          VERSION="build-${GITHUB_RUN_NUMBER}-${COMMIT}"
-          BUILD_DATE="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          COMMIT="${{ steps.meta.outputs.commit }}"
+          VERSION="${{ steps.meta.outputs.version }}"
+          BUILD_DATE="${{ steps.meta.outputs.build_date }}"
           SHA256="$(sha256sum ota/xauusd_chart.bin | awk '{print $1}')"
           SIZE="$(stat -c%s ota/xauusd_chart.bin)"
           URL="https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}/xauusd_chart.bin"
