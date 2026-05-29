@@ -1,0 +1,14 @@
+{
+  "name": "xauusd_chart",
+  "version": "build-2-cf86557",
+  "commit": "cf86557",
+  "build_date": "2026-05-29T12:59:46Z",
+  "target": "esp32c6",
+  "idf": "v5.4.2",
+  "firmware": {
+    "file": "xauusd_chart.bin",
+    "size": 1639520,
+    "sha256": "e33f8dc4ea7ec92a2367cd63fe5e4fc135d062af8f4d14d352ec759092944883",
+    "url": "https://enderekici.github.io/esp32c6-xauusd-chart/xauusd_chart.bin"
+  }
+}
