@@ -85,8 +85,9 @@ static int http_get(const char *url, char *buf, int cap)
     return out;
 }
 
-// klines is a JSON array of arrays; element index 4 is the close (string).
-static int parse_klines(const char *json, float *closes, int max)
+// klines is a JSON array of arrays; index 4 is the close, index 5 the base-asset
+// volume (both strings).
+static int parse_klines(const char *json, float *closes, float *volumes, int max)
 {
     cJSON *root = cJSON_Parse(json);
     if (!root || !cJSON_IsArray(root)) {
@@ -100,6 +101,9 @@ static int parse_klines(const char *json, float *closes, int max)
         if (!cJSON_IsArray(candle)) continue;
         cJSON *close = cJSON_GetArrayItem(candle, 4);
         if (cJSON_IsString(close) && close->valuestring) {
+            cJSON *vol = cJSON_GetArrayItem(candle, 5);
+            volumes[n] = (cJSON_IsString(vol) && vol->valuestring)
+                       ? (float)atof(vol->valuestring) : 0.0f;
             closes[n++] = (float)atof(close->valuestring);
         }
     }
@@ -120,7 +124,7 @@ bool market_fetch_history(market_data_t *out)
     bool ok = false;
     int n = http_get(URL_KLINES, buf, RESP_CAP);
     if (n > 0) {
-        out->n_closes = parse_klines(buf, out->closes, MARKET_MAX_CLOSES);
+        out->n_closes = parse_klines(buf, out->closes, out->volumes, MARKET_MAX_CLOSES);
         if (out->n_closes > 0) {
             ok = true;
         } else {
@@ -141,7 +145,10 @@ bool market_fetch_history(market_data_t *out)
 static SemaphoreHandle_t   s_live_mtx;
 static float               s_live_price;
 static float               s_live_change;
+static float               s_live_high;
+static float               s_live_low;
 static bool                s_live_valid;
+static bool                s_hilo_valid;
 static float               s_spot_price;
 static bool                s_spot_valid;
 static volatile bool       s_live_connected;
@@ -152,7 +159,8 @@ static uint32_t            s_ws_disconnect_count;
 static uint32_t            s_spot_fail_count;
 static esp_websocket_client_handle_t s_ws;
 
-// Parse one @ticker frame: "c" = last price, "P" = 24h change %.
+// Parse one @ticker frame: "c" = last price, "P" = 24h change %, "h"/"l" = 24h
+// high/low. All fields are JSON strings.
 static void parse_ticker(const char *json, int len)
 {
     cJSON *root = cJSON_ParseWithLength(json, len);
@@ -162,11 +170,20 @@ static void parse_ticker(const char *json, int len)
     if (cJSON_IsString(c) && c->valuestring && cJSON_IsString(p) && p->valuestring) {
         float price  = (float)atof(c->valuestring);
         float change = (float)atof(p->valuestring);
+        cJSON *h = cJSON_GetObjectItemCaseSensitive(root, "h");
+        cJSON *l = cJSON_GetObjectItemCaseSensitive(root, "l");
+        bool have_hilo = cJSON_IsString(h) && h->valuestring &&
+                         cJSON_IsString(l) && l->valuestring;
         xSemaphoreTake(s_live_mtx, portMAX_DELAY);
         bool first = !s_live_valid;
         s_live_price  = price;
         s_live_change = change;
         s_live_valid  = true;
+        if (have_hilo) {
+            s_live_high  = (float)atof(h->valuestring);
+            s_live_low   = (float)atof(l->valuestring);
+            s_hilo_valid = true;
+        }
         s_last_live_us = esp_timer_get_time();
         xSemaphoreGive(s_live_mtx);
         if (first) {
@@ -301,6 +318,19 @@ bool market_live_get(float *price, float *change_pct)
 bool market_live_connected(void)
 {
     return s_live_connected;
+}
+
+bool market_live_hilo(float *high, float *low)
+{
+    if (!s_live_mtx) return false;
+    xSemaphoreTake(s_live_mtx, portMAX_DELAY);
+    bool valid = s_hilo_valid;
+    if (valid) {
+        if (high) *high = s_live_high;
+        if (low)  *low  = s_live_low;
+    }
+    xSemaphoreGive(s_live_mtx);
+    return valid;
 }
 
 bool market_spot_get(float *price)

@@ -47,6 +47,19 @@ static lv_obj_t *dot_live;   // small circle: green = WS connected, grey = down
 static lv_obj_t *lbl_live;   // "LIVE" text next to the dot
 static lv_obj_t *chart;
 static lv_chart_series_t *series;
+static lv_chart_series_t *series_hi;   // flat 24h-high reference line
+static lv_chart_series_t *series_lo;   // flat 24h-low reference line
+static lv_obj_t *lbl_hi;               // "H ####" pinned top-right of chart
+static lv_obj_t *lbl_lo;               // "L ####" pinned bottom-right of chart
+static lv_obj_t *vol_chart;            // volume histogram pane below the price chart
+static lv_chart_series_t *vol_series;
+static uint32_t s_fill_color = COL_CYAN;  // glow-fill color, tracks the price line
+
+// Last hi/lo (PAXG space) drawn into the flat reference series + the point
+// count they were drawn at, so the overlay only rewrites on change.
+static float    s_drawn_hi = -1.0f;
+static float    s_drawn_lo = -1.0f;
+static uint32_t s_drawn_pc;
 static SemaphoreHandle_t s_state_mtx;
 static TaskHandle_t s_fetch_task_handle;
 static ui_chart_display_mode_t s_display_mode = UI_CHART_DISPLAY_AUTO;
@@ -117,6 +130,50 @@ static lv_obj_t *mk_label(lv_obj_t *parent, const lv_font_t *font, uint32_t colo
     return l;
 }
 
+// Fill the area under the price line with a vertical gradient (line color at the
+// top fading to transparent at the baseline) for a Binance-style glow. Drawn in
+// the POST phase, on top of the line; fill color == line color so the line stays
+// crisp. At ~96 points over ~150px each segment is ~1-2px wide, so a flat-top
+// rect per segment tracks the slope closely enough to be invisible under the line.
+static void chart_glow_cb(lv_event_t *e)
+{
+    if (s_last_idx < 0) return;  // no data loaded yet
+    lv_obj_t *c = lv_event_get_target_obj(e);
+    uint32_t pc = lv_chart_get_point_count(c);
+    if (pc < 2) return;
+
+    lv_layer_t *layer = lv_event_get_layer(e);
+    lv_area_t coords, content;
+    lv_obj_get_coords(c, &coords);
+    lv_obj_get_content_coords(c, &content);
+    int32_t baseline = content.y2;
+
+    lv_draw_rect_dsc_t d;
+    lv_draw_rect_dsc_init(&d);
+    d.bg_opa = LV_OPA_COVER;
+    d.bg_grad.dir = LV_GRAD_DIR_VER;
+    d.bg_grad.stops_count = 2;
+    d.bg_grad.stops[0].color = lv_color_hex(s_fill_color);
+    d.bg_grad.stops[0].opa = LV_OPA_40;
+    d.bg_grad.stops[0].frac = 0;
+    d.bg_grad.stops[1].color = lv_color_hex(s_fill_color);
+    d.bg_grad.stops[1].opa = LV_OPA_TRANSP;
+    d.bg_grad.stops[1].frac = 255;
+
+    lv_point_t p0, p1;
+    lv_chart_get_point_pos_by_id(c, series, 0, &p0);
+    for (uint32_t i = 1; i < pc; i++) {
+        lv_chart_get_point_pos_by_id(c, series, i, &p1);
+        lv_area_t a;
+        a.x1 = coords.x1 + p0.x;
+        a.x2 = coords.x1 + p1.x;
+        a.y1 = coords.y1 + (p0.y < p1.y ? p0.y : p1.y);  // higher of the two points
+        a.y2 = baseline;
+        if (a.y2 > a.y1) lv_draw_rect(layer, &d, &a);
+        p0 = p1;
+    }
+}
+
 static void build_ui(void)
 {
     lv_obj_t *scr = lv_screen_active();
@@ -175,6 +232,9 @@ static void build_ui(void)
     lv_obj_set_flex_grow(chart, 1);
     lv_obj_set_style_bg_color(chart, lv_color_hex(COL_CARD), 0);
     lv_obj_set_style_bg_opa(chart, LV_OPA_COVER, 0);
+    // Subtle vertical gradient (card -> background) for a touch of depth.
+    lv_obj_set_style_bg_grad_color(chart, lv_color_hex(COL_BG), LV_PART_MAIN);
+    lv_obj_set_style_bg_grad_dir(chart, LV_GRAD_DIR_VER, LV_PART_MAIN);
     lv_obj_set_style_border_color(chart, lv_color_hex(COL_BORDER), 0);
     lv_obj_set_style_border_width(chart, 1, 0);
     lv_obj_set_style_radius(chart, 8, 0);
@@ -189,7 +249,49 @@ static void build_ui(void)
 
     series = lv_chart_add_series(chart, lv_color_hex(COL_CYAN),
                                  LV_CHART_AXIS_PRIMARY_Y);
+    // Flat 24h high/low reference lines, dimmed so they read as guides behind
+    // the price line. Hidden (POINT_NONE) until live hi/lo arrives.
+    series_hi = lv_chart_add_series(chart, lv_color_hex(COL_BORDER),
+                                    LV_CHART_AXIS_PRIMARY_Y);
+    series_lo = lv_chart_add_series(chart, lv_color_hex(COL_BORDER),
+                                    LV_CHART_AXIS_PRIMARY_Y);
+    lv_chart_set_all_value(chart, series_hi, LV_CHART_POINT_NONE);
+    lv_chart_set_all_value(chart, series_lo, LV_CHART_POINT_NONE);
     lv_obj_set_style_line_width(chart, 2, LV_PART_ITEMS);
+
+    // H / L value labels pinned to the chart corners (spot-space numbers).
+    lbl_hi = lv_label_create(chart);
+    lv_obj_set_style_text_font(lbl_hi, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(lbl_hi, lv_color_hex(COL_GREY), 0);
+    lv_obj_align(lbl_hi, LV_ALIGN_TOP_RIGHT, -2, 2);
+    lv_label_set_text(lbl_hi, "");
+
+    lbl_lo = lv_label_create(chart);
+    lv_obj_set_style_text_font(lbl_lo, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(lbl_lo, lv_color_hex(COL_GREY), 0);
+    lv_obj_align(lbl_lo, LV_ALIGN_BOTTOM_RIGHT, -2, -2);
+    lv_label_set_text(lbl_lo, "");
+
+    // Glow fill under the price line (custom draw in the POST phase).
+    lv_obj_add_event_cb(chart, chart_glow_cb, LV_EVENT_DRAW_POST_BEGIN, NULL);
+
+    // Volume histogram pane, Binance-style, beneath the price chart.
+    vol_chart = lv_chart_create(scr);
+    lv_obj_set_width(vol_chart, lv_pct(100));
+    lv_obj_set_height(vol_chart, 44);
+    lv_obj_set_style_bg_color(vol_chart, lv_color_hex(COL_CARD), 0);
+    lv_obj_set_style_bg_opa(vol_chart, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(vol_chart, lv_color_hex(COL_BORDER), 0);
+    lv_obj_set_style_border_width(vol_chart, 1, 0);
+    lv_obj_set_style_radius(vol_chart, 8, 0);
+    lv_obj_set_style_pad_all(vol_chart, 3, 0);
+    lv_chart_set_div_line_count(vol_chart, 0, 0);
+    lv_chart_set_type(vol_chart, LV_CHART_TYPE_BAR);
+    lv_chart_set_update_mode(vol_chart, LV_CHART_UPDATE_MODE_SHIFT);
+    lv_chart_set_point_count(vol_chart, MARKET_MAX_CLOSES);
+    vol_series = lv_chart_add_series(vol_chart, lv_color_hex(COL_GREY),
+                                     LV_CHART_AXIS_PRIMARY_Y);
+    lv_obj_set_style_pad_column(vol_chart, 0, LV_PART_MAIN);  // touching bars
 
     lbl_footer = mk_label(scr, &lv_font_montserrat_14, COL_GREY);
     lv_label_set_text(lbl_footer, "connecting...");
@@ -214,6 +316,37 @@ static void render_price(float price, float change_pct, bool have_change)
     }
 }
 
+// Draw the flat 24h high/low reference lines (PAXG/chart space) and refresh the
+// H/L corner labels (offset into spot space so they match the headline). Must
+// run under the LVGL lock.
+static void update_hilo_overlay(void)
+{
+    float hi, lo;
+    if (!market_live_hilo(&hi, &lo)) return;
+
+    uint32_t pc = lv_chart_get_point_count(chart);
+    if (hi != s_drawn_hi || lo != s_drawn_lo || pc != s_drawn_pc) {
+        for (uint32_t i = 0; i < pc; i++) {
+            lv_chart_set_value_by_id(chart, series_hi, i, (int32_t)(hi + 0.5f));
+            lv_chart_set_value_by_id(chart, series_lo, i, (int32_t)(lo + 0.5f));
+        }
+        s_drawn_hi = hi;
+        s_drawn_lo = lo;
+        s_drawn_pc = pc;
+    }
+
+    // Labels in spot space: shift by the live spot/PAXG gap when both are known.
+    float delta = 0.0f, spot, paxg, change;
+    if (market_spot_get(&spot) && market_live_get(&paxg, &change)) {
+        delta = spot - paxg;
+    }
+    char b[16];
+    snprintf(b, sizeof(b), "H %.0f", hi + delta);
+    lv_label_set_text(lbl_hi, b);
+    snprintf(b, sizeof(b), "L %.0f", lo + delta);
+    lv_label_set_text(lbl_lo, b);
+}
+
 // Recompute the y-range from the data and (re)load the series. Must run under
 // the LVGL lock.
 static void apply_data(const market_data_t *d)
@@ -223,6 +356,13 @@ static void apply_data(const market_data_t *d)
         for (int i = 1; i < d->n_closes; i++) {
             if (d->closes[i] < lo) lo = d->closes[i];
             if (d->closes[i] > hi) hi = d->closes[i];
+        }
+        // Stretch the range to include the live 24h high/low so the reference
+        // lines (and any wick beyond the closes) stay on-screen.
+        float hh, ll;
+        if (market_live_hilo(&hh, &ll)) {
+            if (hh > hi) hi = hh;
+            if (ll < lo) lo = ll;
         }
         // Pad the range a touch so the line isn't glued to the edges.
         float pad = (hi - lo) * 0.08f;
@@ -236,14 +376,30 @@ static void apply_data(const market_data_t *d)
         for (int i = 0; i < d->n_closes; i++) {
             lv_chart_set_value_by_id(chart, series, i, (int32_t)(d->closes[i] + 0.5f));
         }
+        update_hilo_overlay();  // refill flat ref lines at the new point count
         lv_chart_refresh(chart);
 
-        // Color price line + change by direction over the window.
+        // Color price line + change by direction over the window. The glow fill
+        // tracks the same color.
         bool up = d->closes[d->n_closes - 1] >= d->closes[0];
-        lv_chart_set_series_color(chart, series,
-                                  lv_color_hex(up ? COL_GREEN : COL_CYAN));
+        s_fill_color = up ? COL_GREEN : COL_CYAN;
+        lv_chart_set_series_color(chart, series, lv_color_hex(s_fill_color));
         s_last_close = d->closes[d->n_closes - 1];
         s_last_idx   = d->n_closes - 1;
+
+        // Volume histogram: scale to the window's max so bars use the full pane.
+        float vmax = 0.0f;
+        for (int i = 0; i < d->n_closes; i++) {
+            if (d->volumes[i] > vmax) vmax = d->volumes[i];
+        }
+        if (vmax <= 0.0f) vmax = 1.0f;
+        lv_chart_set_range(vol_chart, LV_CHART_AXIS_PRIMARY_Y, 0, (int32_t)(vmax + 0.5f));
+        lv_chart_set_point_count(vol_chart, d->n_closes);
+        for (int i = 0; i < d->n_closes; i++) {
+            lv_chart_set_value_by_id(vol_chart, vol_series, i,
+                                     (int32_t)(d->volumes[i] + 0.5f));
+        }
+        lv_chart_refresh(vol_chart);
     }
 
     float paxg, change, spot;
@@ -451,6 +607,9 @@ static void live_cb(lv_timer_t *t)
         lv_chart_set_value_by_id(chart, series, s_last_idx,
                                  (int32_t)(paxg + 0.5f));
     }
+
+    // Refresh the 24h high/low reference lines + labels (only redraws on change).
+    update_hilo_overlay();
 }
 
 static void fetch_task(void *arg)

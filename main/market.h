@@ -13,7 +13,8 @@ typedef struct {
     float price;                       // reserved for one-shot price fetches
     float change_pct;                  // reserved for one-shot change fetches
     float closes[MARKET_MAX_CLOSES];   // candle close prices, oldest -> newest
-    int   n_closes;                    // valid entries in closes[]
+    float volumes[MARKET_MAX_CLOSES];  // candle base-asset volume, aligned to closes
+    int   n_closes;                    // valid entries in closes[]/volumes[]
     bool  ok;                          // true if chart history loaded
 } market_data_t;
 
@@ -52,6 +53,11 @@ bool market_live_connected(void);
 // Latest true-spot XAU/USD price from gold-api (the number matching
 // TradingView). Returns true once a price has been fetched. Thread-safe.
 bool market_spot_get(float *price);
+
+// Latest 24h high/low from the live @ticker stream (PAXG space, same scale as
+// the chart series). Returns true once a ticker frame with both has arrived.
+// Thread-safe.
+bool market_live_hilo(float *high, float *low);
 
 // Snapshot of live/spot source health and latest values. Thread-safe.
 void market_status_get(market_status_t *out);
