@@ -242,6 +242,13 @@ static void chart_glow_cb(lv_event_t *e)
     td.font = &lv_font_montserrat_14;
     td.text_local = 1;  // duplicate text — the stack buffer is gone by draw time
 
+    // Dark backing chip so labels stay readable where the price line crosses.
+    lv_draw_rect_dsc_t chip;
+    lv_draw_rect_dsc_init(&chip);
+    chip.bg_color = lv_color_hex(COL_BG);
+    chip.bg_opa = LV_OPA_70;
+    chip.radius = 2;
+
     char lbuf[12];
     int32_t first = ((lo + step - 1) / step) * step;  // first multiple >= lo
     for (int32_t v = first; v <= hi; v += step) {
@@ -250,7 +257,9 @@ static void chart_glow_cb(lv_event_t *e)
         lv_area_t line = { content.x1, y, content.x2, y };
         lv_draw_rect(layer, &ld, &line);
         snprintf(lbuf, sizeof(lbuf), "%d", (int)v);
-        lv_area_t la = { content.x1 + 2, y + 1, content.x1 + 44, y + 16 };
+        lv_area_t chip_a = { content.x1 + 1, y + 1, content.x1 + 39, y + 17 };
+        lv_draw_rect(layer, &chip, &chip_a);
+        lv_area_t la = { content.x1 + 3, y + 1, content.x1 + 44, y + 16 };
         td.text = lbuf;
         lv_draw_label(layer, &td, &la);
     }
