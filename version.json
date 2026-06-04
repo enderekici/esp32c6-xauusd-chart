@@ -1,14 +1,14 @@
 {
   "name": "xauusd_chart",
-  "version": "build-3-061e3f0",
-  "commit": "061e3f0",
-  "build_date": "2026-05-29T13:13:12Z",
+  "version": "build-4-3273686",
+  "commit": "3273686",
+  "build_date": "2026-06-04T00:25:51Z",
   "target": "esp32c6",
   "idf": "v5.4.2",
   "firmware": {
     "file": "xauusd_chart.bin",
-    "size": 1639872,
-    "sha256": "f6080c7102f2c67a8fb2dc01cc438ff081aedf0bf73670826cb9cdb6fca82c7f",
+    "size": 1676544,
+    "sha256": "19c9ccf8be5702f8beaa0508831fd62d49b519f706184000a3aa2aac8bce1fb1",
     "url": "https://enderekici.github.io/esp32c6-xauusd-chart/xauusd_chart.bin"
   }
 }
