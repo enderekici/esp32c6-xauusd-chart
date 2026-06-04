@@ -40,6 +40,7 @@ static const char *TAG = "ui";
 #define SETTINGS_KEY_BRIGHTNESS   "bright"
 
 static lv_obj_t *lbl_price;
+static lv_obj_t *lbl_price_cents;      // small cents, baseline-aligned to lbl_price
 static lv_obj_t *lbl_change;
 static lv_obj_t *lbl_clock;
 static lv_obj_t *lbl_footer;
@@ -60,6 +61,9 @@ static uint32_t s_fill_color = COL_CYAN;  // glow-fill color, tracks the price l
 static float    s_drawn_hi = -1.0f;
 static float    s_drawn_lo = -1.0f;
 static uint32_t s_drawn_pc;
+
+// Previous live tick, to flash the headline green/red on up/down moves.
+static float    s_prev_tick = -1.0f;
 static SemaphoreHandle_t s_state_mtx;
 static TaskHandle_t s_fetch_task_handle;
 static ui_chart_display_mode_t s_display_mode = UI_CHART_DISPLAY_AUTO;
@@ -130,6 +134,13 @@ static lv_obj_t *mk_label(lv_obj_t *parent, const lv_font_t *font, uint32_t colo
     return l;
 }
 
+// Pulse the LIVE dot's opacity (a breathing effect) — driven by an infinite
+// lv_anim set up in build_ui.
+static void dot_pulse_cb(void *obj, int32_t v)
+{
+    lv_obj_set_style_bg_opa((lv_obj_t *)obj, (lv_opa_t)v, 0);
+}
+
 // Fill the area under the price line with a vertical gradient (line color at the
 // top fading to transparent at the baseline) for a Binance-style glow. Drawn in
 // the POST phase, on top of the line; fill color == line color so the line stays
@@ -172,6 +183,25 @@ static void chart_glow_cb(lv_event_t *e)
         if (a.y2 > a.y1) lv_draw_rect(layer, &d, &a);
         p0 = p1;
     }
+
+    // Glowing live-tip cursor at the most recent point: a soft halo + bright core.
+    lv_point_t pt;
+    lv_chart_get_point_pos_by_id(c, series, (uint32_t)s_last_idx, &pt);
+    int32_t cx = coords.x1 + pt.x;
+    int32_t cy = coords.y1 + pt.y;
+
+    lv_draw_rect_dsc_t m;
+    lv_draw_rect_dsc_init(&m);
+    m.radius = LV_RADIUS_CIRCLE;
+    m.bg_color = lv_color_hex(s_fill_color);
+    m.bg_opa = LV_OPA_30;
+    lv_area_t halo = { cx - 8, cy - 8, cx + 8, cy + 8 };
+    lv_draw_rect(layer, &m, &halo);
+
+    m.bg_opa = LV_OPA_COVER;
+    m.bg_color = lv_color_white();
+    lv_area_t core = { cx - 3, cy - 3, cx + 3, cy + 3 };
+    lv_draw_rect(layer, &m, &core);
 }
 
 static void build_ui(void)
@@ -185,46 +215,35 @@ static void build_ui(void)
     lv_obj_set_scrollbar_mode(scr, LV_SCROLLBAR_MODE_OFF);
     lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
 
-    lv_obj_t *title = mk_label(scr, &lv_font_montserrat_20, COL_CYAN);
-    lv_label_set_text(title, "XAU / USD");
-
-    lv_obj_t *sub = mk_label(scr, &lv_font_montserrat_14, COL_GREY);
-    lv_label_set_text(sub, "gold spot");
-
-    lbl_clock = mk_label(scr, &lv_font_montserrat_14, COL_CYAN);
+    // London clock (date + time) on its own full-width line.
+    lbl_clock = mk_label(scr, &lv_font_montserrat_14, COL_GREY);
     lv_label_set_text(lbl_clock, "syncing time...");
 
-    lbl_price = mk_label(scr, &lv_font_montserrat_28, COL_TEXT);
-    lv_label_set_text(lbl_price, "----.--");
+    // Hero price: large whole-dollar figure + small cents, bottom-aligned.
+    lv_obj_t *prow = lv_obj_create(scr);
+    lv_obj_remove_style_all(prow);
+    lv_obj_set_width(prow, lv_pct(100));
+    lv_obj_set_height(prow, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(prow, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(prow, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_END);
+    lv_obj_set_style_pad_column(prow, 1, 0);
+    lv_obj_clear_flag(prow, LV_OBJ_FLAG_SCROLLABLE);
 
-    // Change line: percent on the left, a LIVE dot + label pinned to the right.
-    lv_obj_t *row = lv_obj_create(scr);
-    lv_obj_remove_style_all(row);
-    lv_obj_set_width(row, lv_pct(100));
-    lv_obj_set_height(row, LV_SIZE_CONTENT);
-    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START,
-                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_column(row, 5, 0);
-    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    lbl_price = lv_label_create(prow);
+    lv_obj_set_style_text_font(lbl_price, &lv_font_montserrat_40, 0);
+    lv_obj_set_style_text_color(lbl_price, lv_color_hex(COL_TEXT), 0);
+    lv_label_set_text(lbl_price, "$----");
 
-    lbl_change = lv_label_create(row);
-    lv_obj_set_style_text_font(lbl_change, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(lbl_change, lv_color_hex(COL_GREY), 0);
-    lv_obj_set_flex_grow(lbl_change, 1);
+    lbl_price_cents = lv_label_create(prow);
+    lv_obj_set_style_text_font(lbl_price_cents, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(lbl_price_cents, lv_color_hex(COL_GREY), 0);
+    lv_obj_set_style_pad_bottom(lbl_price_cents, 5, 0);
+    lv_label_set_text(lbl_price_cents, ".--");
+
+    // 24h change line: direction arrow + absolute move + percent.
+    lbl_change = mk_label(scr, &lv_font_montserrat_16, COL_GREY);
     lv_label_set_text(lbl_change, "+0.00%");
-
-    dot_live = lv_obj_create(row);
-    lv_obj_remove_style_all(dot_live);
-    lv_obj_set_size(dot_live, 10, 10);
-    lv_obj_set_style_radius(dot_live, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_bg_opa(dot_live, LV_OPA_COVER, 0);
-    lv_obj_set_style_bg_color(dot_live, lv_color_hex(COL_GREY), 0);
-
-    lbl_live = lv_label_create(row);
-    lv_obj_set_style_text_font(lbl_live, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(lbl_live, lv_color_hex(COL_GREY), 0);
-    lv_label_set_text(lbl_live, "LIVE");
 
     // Chart fills the remaining vertical space.
     chart = lv_chart_create(scr);
@@ -272,6 +291,40 @@ static void build_ui(void)
     lv_obj_align(lbl_lo, LV_ALIGN_BOTTOM_RIGHT, -2, -2);
     lv_label_set_text(lbl_lo, "");
 
+    // Pulsing LIVE indicator, overlaid in the chart's top-left corner.
+    lv_obj_t *live_box = lv_obj_create(chart);
+    lv_obj_remove_style_all(live_box);
+    lv_obj_set_size(live_box, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(live_box, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(live_box, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(live_box, 4, 0);
+    lv_obj_align(live_box, LV_ALIGN_TOP_LEFT, 0, 0);
+    lv_obj_clear_flag(live_box, LV_OBJ_FLAG_SCROLLABLE);
+
+    dot_live = lv_obj_create(live_box);
+    lv_obj_remove_style_all(dot_live);
+    lv_obj_set_size(dot_live, 8, 8);
+    lv_obj_set_style_radius(dot_live, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_opa(dot_live, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(dot_live, lv_color_hex(COL_GREY), 0);
+
+    lbl_live = lv_label_create(live_box);
+    lv_obj_set_style_text_font(lbl_live, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(lbl_live, lv_color_hex(COL_GREY), 0);
+    lv_label_set_text(lbl_live, "LIVE");
+
+    // Pulse the LIVE dot's opacity continuously (breathing effect).
+    lv_anim_t pulse;
+    lv_anim_init(&pulse);
+    lv_anim_set_var(&pulse, dot_live);
+    lv_anim_set_exec_cb(&pulse, dot_pulse_cb);
+    lv_anim_set_values(&pulse, LV_OPA_COVER, LV_OPA_30);
+    lv_anim_set_duration(&pulse, 850);
+    lv_anim_set_reverse_duration(&pulse, 850);
+    lv_anim_set_repeat_count(&pulse, LV_ANIM_REPEAT_INFINITE);
+    lv_anim_start(&pulse);
+
     // Glow fill under the price line (custom draw in the POST phase).
     lv_obj_add_event_cb(chart, chart_glow_cb, LV_EVENT_DRAW_POST_BEGIN, NULL);
 
@@ -302,14 +355,27 @@ static void build_ui(void)
 // LV_SPRINTF_USE_FLOAT is set, rendering "$f" / "+f%" instead of numbers.
 static void render_price(float price, float change_pct, bool have_change)
 {
-    char buf[32];
+    char buf[40];
     if (price > 0.0f) {
-        snprintf(buf, sizeof(buf), "$%.2f", price);
+        int dollars = (int)price;
+        int cents = (int)((price - (float)dollars) * 100.0f + 0.5f);
+        if (cents >= 100) { dollars += 1; cents -= 100; }
+        snprintf(buf, sizeof(buf), "$%d", dollars);
         lv_label_set_text(lbl_price, buf);
+        snprintf(buf, sizeof(buf), ".%02d", cents);
+        lv_label_set_text(lbl_price_cents, buf);
     }
     if (have_change) {
         bool pos = change_pct >= 0.0f;
-        snprintf(buf, sizeof(buf), "%s%.2f%% 24h", pos ? "+" : "", change_pct);
+        // Absolute 24h move derived from the percent: open = price / (1 + pct/100).
+        float abs_chg = 0.0f;
+        if (price > 0.0f) {
+            float denom = 1.0f + change_pct / 100.0f;
+            if (denom > 0.0f) abs_chg = price - price / denom;
+        }
+        snprintf(buf, sizeof(buf), "%s %s%.2f  %s%.2f%%",
+                 pos ? LV_SYMBOL_UP : LV_SYMBOL_DOWN,
+                 pos ? "+" : "", abs_chg, pos ? "+" : "", change_pct);
         lv_label_set_text(lbl_change, buf);
         lv_obj_set_style_text_color(lbl_change,
                                     lv_color_hex(pos ? COL_GREEN : COL_RED), 0);
@@ -600,6 +666,17 @@ static void live_cb(lv_timer_t *t)
         render_price(spot, change, have_live);
     } else if (have_live) {
         render_price(paxg, change, true);
+    }
+
+    // Flash the headline green/red on the live tick direction (white when flat).
+    if (have_live) {
+        uint32_t col = COL_TEXT;
+        if (s_prev_tick > 0.0f) {
+            if (paxg > s_prev_tick + 0.001f)      col = COL_GREEN;
+            else if (paxg < s_prev_tick - 0.001f) col = COL_RED;
+        }
+        lv_obj_set_style_text_color(lbl_price, lv_color_hex(col), 0);
+        s_prev_tick = paxg;
     }
 
     // Chart tip tracks the live PAXG tick (the series is loaded in PAXG space).
