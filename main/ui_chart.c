@@ -64,6 +64,11 @@ static uint32_t s_drawn_pc;
 
 // Previous live tick, to flash the headline green/red on up/down moves.
 static float    s_prev_tick = -1.0f;
+
+// Chart Y-range (PAXG space) from the last data load, for the price-level grid.
+static int32_t  s_range_min;
+static int32_t  s_range_max;
+static bool     s_range_valid;
 static SemaphoreHandle_t s_state_mtx;
 static TaskHandle_t s_fetch_task_handle;
 static ui_chart_display_mode_t s_display_mode = UI_CHART_DISPLAY_AUTO;
@@ -202,6 +207,53 @@ static void chart_glow_cb(lv_event_t *e)
     m.bg_color = lv_color_white();
     lv_area_t core = { cx - 3, cy - 3, cx + 3, cy + 3 };
     lv_draw_rect(layer, &m, &core);
+
+    // Price-level grid: thin dim lines at round price levels, labeled in spot
+    // space (chart series is PAXG, so shift by the live spot/PAXG gap).
+    if (!s_range_valid || s_range_max <= s_range_min) return;
+    float delta = 0.0f, spot, pg, ch;
+    if (market_spot_get(&spot) && market_live_get(&pg, &ch)) delta = spot - pg;
+    int32_t off = (int32_t)delta;
+    int32_t lo = s_range_min + off;
+    int32_t hi = s_range_max + off;
+    int32_t span = hi - lo;
+    if (span < 1) return;
+
+    // Pick a "nice" step so ~4 levels fit.
+    static const int32_t nice[] = { 5, 10, 20, 25, 50, 100, 200 };
+    int32_t target = span / 4;
+    int32_t step = nice[0];
+    for (unsigned i = 0; i < sizeof(nice) / sizeof(nice[0]); i++) {
+        step = nice[i];
+        if (step >= target) break;
+    }
+
+    int32_t plot_h = content.y2 - content.y1;
+    int32_t denom = s_range_max - s_range_min;
+
+    lv_draw_rect_dsc_t ld;
+    lv_draw_rect_dsc_init(&ld);
+    ld.bg_color = lv_color_hex(COL_BORDER);
+    ld.bg_opa = LV_OPA_50;
+
+    lv_draw_label_dsc_t td;
+    lv_draw_label_dsc_init(&td);
+    td.color = lv_color_hex(COL_GREY);
+    td.font = &lv_font_montserrat_14;
+    td.text_local = 1;  // duplicate text — the stack buffer is gone by draw time
+
+    char lbuf[12];
+    int32_t first = ((lo + step - 1) / step) * step;  // first multiple >= lo
+    for (int32_t v = first; v <= hi; v += step) {
+        int32_t y = content.y2 - (int32_t)((int64_t)(v - off - s_range_min) * plot_h / denom);
+        if (y < content.y1 + 20 || y > content.y2 - 18) continue;  // clear H/L labels
+        lv_area_t line = { content.x1, y, content.x2, y };
+        lv_draw_rect(layer, &ld, &line);
+        snprintf(lbuf, sizeof(lbuf), "%d", (int)v);
+        lv_area_t la = { content.x1 + 2, y + 1, content.x1 + 44, y + 16 };
+        td.text = lbuf;
+        lv_draw_label(layer, &td, &la);
+    }
 }
 
 static void build_ui(void)
@@ -260,7 +312,7 @@ static void build_ui(void)
     lv_obj_set_style_pad_all(chart, 4, 0);
     lv_obj_set_style_size(chart, 0, 0, LV_PART_INDICATOR);  // hide point markers
     lv_chart_set_type(chart, LV_CHART_TYPE_LINE);
-    lv_chart_set_div_line_count(chart, 3, 0);
+    lv_chart_set_div_line_count(chart, 0, 0);  // we draw round price levels instead
     lv_obj_set_style_line_color(chart, lv_color_hex(COL_BORDER), LV_PART_MAIN);
     lv_obj_set_style_line_opa(chart, LV_OPA_30, LV_PART_MAIN);
     lv_chart_set_update_mode(chart, LV_CHART_UPDATE_MODE_SHIFT);
@@ -437,6 +489,9 @@ static void apply_data(const market_data_t *d)
         int ymax = (int)(hi + pad + 0.5f);
         if (ymax <= ymin) ymax = ymin + 1;
         lv_chart_set_range(chart, LV_CHART_AXIS_PRIMARY_Y, ymin, ymax);
+        s_range_min = ymin;
+        s_range_max = ymax;
+        s_range_valid = true;
 
         lv_chart_set_point_count(chart, d->n_closes);
         for (int i = 0; i < d->n_closes; i++) {
